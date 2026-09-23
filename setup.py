@@ -193,7 +193,14 @@ class BuildExtension(build_ext):
         if self.compiler.compiler_type == "msvc":
             self.compiler._cpp_extensions += [".cu", ".cuh"]
             original_compile = self.compiler.compile
-            original_spawn = self.compiler.spawn
+            # setuptools >= ~82 routes MSVCCompiler.compile() through
+            # self.call() instead of the older self.spawn() (spawn is now
+            # just a deprecated shim around call). Hook whichever one is
+            # the real transport, so .cu sources still get redirected to
+            # nvcc instead of silently being compiled as plain C++ by
+            # cl.exe.
+            transport_attr = "call" if hasattr(self.compiler, "call") else "spawn"
+            original_transport = getattr(self.compiler, transport_attr)
         else:
             original_compile = self.compiler._compile
 
@@ -241,7 +248,7 @@ class BuildExtension(build_ext):
             cflags = copy.deepcopy(extra_postargs)
             extra_postargs = None
 
-            def spawn(cmd, cflags):
+            def spawn(cmd, cflags, **kwargs):
                 # Using regex to match src, obj and include files
                 src_regex = re.compile("/T(p|c)(.*)")
                 src_list = [m.group(2) for m in (src_regex.match(elem) for elem in cmd) if m]
@@ -284,10 +291,14 @@ class BuildExtension(build_ext):
                         cflags = COMMON_MSVC_FLAGS + cflags
                         cmd += cflags
 
-                return original_spawn(cmd)
+                return original_transport(cmd, **kwargs)
 
             try:
-                self.compiler.spawn = lambda cmd: spawn(cmd, cflags)
+                setattr(
+                    self.compiler,
+                    transport_attr,
+                    lambda cmd, **kwargs: spawn(cmd, cflags, **kwargs),
+                )
                 return original_compile(
                     sources,
                     output_dir,
@@ -299,7 +310,7 @@ class BuildExtension(build_ext):
                     depends,
                 )
             finally:
-                self.compiler.spawn = original_spawn
+                setattr(self.compiler, transport_attr, original_transport)
 
         # Monkey-patch the _compile method.
         if self.compiler.compiler_type == "msvc":
@@ -517,7 +528,6 @@ setup(
     include_package_data=True,
     data_files=[("data", ["Common/data/head.mat"])],
     ext_modules=[minPICCS_ext, Ax_ext, Atb_ext, tv_proximal_ext, minTV_ext, AwminTV_ext, gpuUtils_ext, RandomNumberGenerator_ext],
-    py_modules=["tigre.py"],
     cmdclass={"build_ext": BuildExtension},
     # since the package has c code, the egg cannot be zipped
     zip_safe=False,
